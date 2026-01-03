@@ -14,7 +14,7 @@ import { TableRow } from '@tiptap/extension-table-row'
 import { TableHeader } from '@tiptap/extension-table-header'
 import { TableCell } from '@tiptap/extension-table-cell'
 import { Collaboration } from '@tiptap/extension-collaboration'
-import { Markdown } from 'tiptap-markdown'
+import { Markdown } from '@tiptap/markdown'
 import * as Y from 'yjs'
 import { normalizeMarkdown } from './lib/markdown'
 import type { AnyExtension } from '@tiptap/core'
@@ -44,8 +44,8 @@ type ChatMessage = {
 function buildExtensions(approach: Approach, ydoc: Y.Doc | null): AnyExtension[] {
   if (approach === 'B') {
     return [
-      StarterKit,
       Markdown,
+      StarterKit,
       Table.configure({ resizable: true }),
       TableRow,
       TableHeader,
@@ -84,6 +84,14 @@ function nowIso() {
   return new Date().toISOString()
 }
 
+function isTiptapDoc(value: unknown): value is { type: string } {
+  return !!value && typeof value === 'object' && (value as { type?: string }).type === 'doc'
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
 export default function App() {
   const [approach, setApproach] = useState<Approach>('A')
   const [aiRunning, setAiRunning] = useState(false)
@@ -98,15 +106,37 @@ export default function App() {
   const debounceRef = useRef<number | null>(null)
   const lastAppliedMarkdown = useRef<string | null>(null)
   const lastSavedJson = useRef<string | null>(null)
+  const canonicalMarkdownRef = useRef(canonicalMarkdown)
+  const aiRunningRef = useRef(aiRunning)
+  const previewModeRef = useRef(previewMode)
 
   const ydoc = useMemo(() => (approach === 'A' ? new Y.Doc() : null), [approach])
 
   const editor = useEditor(
     {
       extensions: buildExtensions(approach, ydoc),
-      content: '',
+      content: approach === 'B' ? canonicalMarkdown : '',
+      contentType: approach === 'B' ? 'markdown' : undefined,
       onUpdate: ({ editor }) => {
-        if (approach !== 'B' || aiRunning || previewMode) return
+        if (approach !== 'B' || aiRunningRef.current || previewModeRef.current) return
+        if (debounceRef.current) {
+          window.clearTimeout(debounceRef.current)
+        }
+        debounceRef.current = window.setTimeout(() => {
+          const markdown = normalizeMarkdown(editor.getMarkdown())
+          if (markdown === canonicalMarkdownRef.current) return
+          canonicalMarkdownRef.current = markdown
+          lastAppliedMarkdown.current = markdown
+          setCanonicalMarkdown(markdown)
+          setLastSyncAt(nowIso())
+          addRevision({
+            approach,
+            actor: 'human',
+            summary: 'Auto-save (idle)',
+            timestamp: nowIso(),
+            snapshot: markdown
+          })
+        }, 700)
       }
       ,
       onBlur: ({ editor }) => {
@@ -139,15 +169,41 @@ export default function App() {
   useEffect(() => {
     if (!editor) return
     if (approach === 'A' && editor.isEmpty) {
-      editor.commands.setContent(INITIAL_MARKDOWN, { emitUpdate: false })
+      editor.commands.setContent(INITIAL_MARKDOWN, { emitUpdate: false, contentType: 'markdown' })
     }
-    if (approach === 'B' && previewMode) {
+    if (approach === 'B' && (previewMode || editor.isEmpty)) {
       if (lastAppliedMarkdown.current !== canonicalMarkdown) {
-        editor.commands.setContent(canonicalMarkdown, { emitUpdate: false })
+        const applied = editor.commands.setContent(canonicalMarkdown, {
+          emitUpdate: false,
+          contentType: 'markdown'
+        })
+        if (!applied || editor.isEmpty) {
+          editor.commands.setContent(canonicalMarkdown, { emitUpdate: false })
+        }
         lastAppliedMarkdown.current = canonicalMarkdown
       }
     }
   }, [approach, editor, canonicalMarkdown, previewMode])
+
+  useEffect(() => {
+    canonicalMarkdownRef.current = canonicalMarkdown
+  }, [canonicalMarkdown])
+
+  useEffect(() => {
+    aiRunningRef.current = aiRunning
+  }, [aiRunning])
+
+  useEffect(() => {
+    previewModeRef.current = previewMode
+  }, [previewMode])
+
+  useEffect(() => {
+    return () => {
+      if (debounceRef.current) {
+        window.clearTimeout(debounceRef.current)
+      }
+    }
+  }, [])
 
   const resetForApproach = (nextApproach: Approach) => {
     setApproach(nextApproach)
@@ -157,6 +213,12 @@ export default function App() {
     setChatMessages([])
     setChatInput('')
     setPreviewMode(true)
+    lastAppliedMarkdown.current = null
+    lastSavedJson.current = null
+    if (debounceRef.current) {
+      window.clearTimeout(debounceRef.current)
+      debounceRef.current = null
+    }
   }
 
   const addRevision = (entry: Omit<RevisionEntry, 'id'>) => {
@@ -188,20 +250,6 @@ export default function App() {
     })
   }
 
-  const handleSaveMarkdown = () => {
-    if (!editor || approach !== 'B' || previewMode) return
-    const markdown = normalizeMarkdown(editor.storage.markdown.getMarkdown())
-    setCanonicalMarkdown(markdown)
-    setLastSyncAt(nowIso())
-    addRevision({
-      approach,
-      actor: 'human',
-      summary: 'Human save (markdown)',
-      timestamp: nowIso(),
-      snapshot: markdown
-    })
-  }
-
   const handleRollback = (entry: RevisionEntry) => {
     if (!editor) return
     if (entry.approach !== approach) return
@@ -213,7 +261,11 @@ export default function App() {
 
     const markdown = entry.snapshot as string
     setCanonicalMarkdown(markdown)
-    editor.commands.setContent(markdown, { emitUpdate: false })
+    const applied = editor.commands.setContent(markdown, { emitUpdate: false, contentType: 'markdown' })
+    if (!applied || editor.isEmpty) {
+      editor.commands.setContent(markdown, { emitUpdate: false })
+    }
+    lastAppliedMarkdown.current = markdown
   }
 
   const pushChatMessage = (message: Omit<ChatMessage, 'id'>) => {
@@ -242,7 +294,7 @@ export default function App() {
         approach === 'A'
           ? {
               mode: 'A',
-              html: editor.getHTML(),
+              docJson: editor.getJSON(),
               recentRevision: revisionLog[0]?.summary || '',
               instruction
             }
@@ -266,7 +318,13 @@ export default function App() {
       const data = await response.json()
 
       if (approach === 'A') {
-        editor.commands.setContent(data.html, { emitUpdate: false })
+        const nextDoc = isTiptapDoc(data.docJson) ? data.docJson : null
+        const nextHtml = isNonEmptyString(data.html) ? data.html : null
+        const nextContent = nextDoc ?? nextHtml
+        if (!nextContent) {
+          throw new Error('AI edit returned no content')
+        }
+        editor.commands.setContent(nextContent, { emitUpdate: false })
         addRevision({
           approach,
           actor: 'ai',
@@ -275,16 +333,41 @@ export default function App() {
           snapshot: editor.getJSON()
         })
       } else {
-        const markdown = normalizeMarkdown(data.markdown || canonicalMarkdown)
-        setCanonicalMarkdown(markdown)
-        editor.commands.setContent(markdown, { emitUpdate: false })
-        addRevision({
-          approach,
-          actor: 'ai',
-          summary: data.summary || 'AI edit',
-          timestamp: nowIso(),
-          snapshot: markdown
-        })
+        const nextMarkdown = isNonEmptyString(data.markdown) ? data.markdown : null
+        const nextHtml = isNonEmptyString(data.html) ? data.html : null
+        if (nextMarkdown) {
+          const markdown = normalizeMarkdown(nextMarkdown)
+          setCanonicalMarkdown(markdown)
+          const applied = editor.commands.setContent(markdown, {
+            emitUpdate: false,
+            contentType: 'markdown'
+          })
+          if (!applied || editor.isEmpty) {
+            editor.commands.setContent(markdown, { emitUpdate: false })
+          }
+          lastAppliedMarkdown.current = markdown
+          addRevision({
+            approach,
+            actor: 'ai',
+            summary: data.summary || 'AI edit',
+            timestamp: nowIso(),
+            snapshot: markdown
+          })
+        } else if (nextHtml) {
+          editor.commands.setContent(nextHtml, { emitUpdate: false, contentType: 'html' })
+          const markdown = normalizeMarkdown(editor.getMarkdown())
+          setCanonicalMarkdown(markdown)
+          lastAppliedMarkdown.current = markdown
+          addRevision({
+            approach,
+            actor: 'ai',
+            summary: data.summary || 'AI edit',
+            timestamp: nowIso(),
+            snapshot: markdown
+          })
+        } else {
+          throw new Error('AI edit returned no markdown')
+        }
       }
 
       if (data.reply) {
@@ -346,32 +429,50 @@ export default function App() {
       })
 
       if (approach === 'A' && (data.docJson || data.html || data.markdown)) {
-        const nextContent = data.docJson ?? data.html ?? data.markdown
+        const nextDoc = isTiptapDoc(data.docJson) ? data.docJson : null
+        const nextHtml = isNonEmptyString(data.html) ? data.html : null
+        const nextMarkdown = isNonEmptyString(data.markdown) ? data.markdown : null
+        const nextContent = nextDoc ?? nextHtml ?? nextMarkdown
         if (nextContent) {
           editor?.commands.setContent(nextContent, { emitUpdate: false })
+          addRevision({
+            approach,
+            actor: 'ai',
+            summary: data.summary || 'AI edit',
+            timestamp: nowIso(),
+            snapshot: editor?.getJSON()
+          })
         }
-        addRevision({
-          approach,
-          actor: 'ai',
-          summary: data.summary || 'AI edit',
-          timestamp: nowIso(),
-          snapshot: editor?.getJSON()
-        })
       }
 
-      if (approach === 'B' && (data.markdown || data.html)) {
-        const rawContent = data.markdown ?? data.html ?? ''
-        editor?.commands.setContent(rawContent, { emitUpdate: false })
-        const markdown = normalizeMarkdown(editor?.storage.markdown.getMarkdown() || rawContent)
-        setCanonicalMarkdown(markdown)
-        lastAppliedMarkdown.current = markdown
-        addRevision({
-          approach,
-          actor: 'ai',
-          summary: data.summary || 'AI edit',
-          timestamp: nowIso(),
-          snapshot: markdown
-        })
+      if (approach === 'B' && (isNonEmptyString(data.markdown) || isNonEmptyString(data.html))) {
+        const nextMarkdown = isNonEmptyString(data.markdown) ? data.markdown : null
+        const nextHtml = isNonEmptyString(data.html) ? data.html : null
+        if (nextMarkdown) {
+          if (editor) {
+            const applied = editor.commands.setContent(nextMarkdown, {
+              emitUpdate: false,
+              contentType: 'markdown'
+            })
+            if (!applied || editor.isEmpty) {
+              editor.commands.setContent(nextMarkdown, { emitUpdate: false })
+            }
+          }
+        } else if (nextHtml) {
+          editor?.commands.setContent(nextHtml, { emitUpdate: false, contentType: 'html' })
+        }
+        if (editor) {
+          const markdown = normalizeMarkdown(editor.getMarkdown())
+          setCanonicalMarkdown(markdown)
+          lastAppliedMarkdown.current = markdown
+          addRevision({
+            approach,
+            actor: 'ai',
+            summary: data.summary || 'AI edit',
+            timestamp: nowIso(),
+            snapshot: markdown
+          })
+        }
       }
     } catch (error) {
       pushChatMessage({
@@ -428,11 +529,6 @@ export default function App() {
           <button onClick={handleCheckpoint} disabled={!editor || aiRunning}>
             Save checkpoint
           </button>
-          {approach === 'B' && !previewMode && (
-            <button onClick={handleSaveMarkdown} disabled={!editor || aiRunning}>
-              Save markdown
-            </button>
-          )}
         </div>
       </section>
 

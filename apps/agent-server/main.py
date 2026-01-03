@@ -91,6 +91,15 @@ AGENT = Agent(
 
 CHAT_SESSIONS: Dict[str, list[Dict[str, str]]] = {}
 
+def is_tiptap_doc(value: Any) -> bool:
+    return isinstance(value, dict) and value.get("type") == "doc"
+
+
+def cleaned_text(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
 
 async def run_agent_edit(mode: str, content: str, recent_revision: str, instruction: str) -> Optional[EditResponse]:
     if Agent is None or Runner is None:
@@ -115,15 +124,15 @@ async def run_agent_edit(mode: str, content: str, recent_revision: str, instruct
     try:
         payload: Dict[str, Any] = json.loads(result.final_output)
         json_payload = payload.get('docJson')
-        if not isinstance(json_payload, dict):
+        if not is_tiptap_doc(json_payload):
             json_payload = None
         return EditResponse(
             summary=payload.get('summary', 'AI edit'),
             ack=payload.get('ack', ''),
             reply=payload.get('reply', ''),
-            html=payload.get('html'),
+            html=cleaned_text(payload.get('html')),
             docJson=json_payload,
-            markdown=payload.get('markdown'),
+            markdown=cleaned_text(payload.get('markdown')),
         )
     except json.JSONDecodeError:
         return None
@@ -154,14 +163,14 @@ async def run_agent_chat(mode: str, message: str, content: str, session_id: str)
     try:
         payload: Dict[str, Any] = json.loads(result.final_output)
         json_payload = payload.get('docJson')
-        if not isinstance(json_payload, dict):
+        if not is_tiptap_doc(json_payload):
             json_payload = None
         response = ChatResponse(
             reply=payload.get('reply', '').strip() or 'Done.',
             summary=payload.get('summary', 'AI edit'),
-            html=payload.get('html'),
+            html=cleaned_text(payload.get('html')),
             docJson=json_payload,
-            markdown=payload.get('markdown'),
+            markdown=cleaned_text(payload.get('markdown')),
             sessionId=session_id,
         )
         return response

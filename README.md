@@ -11,8 +11,8 @@ Minimal repo to compare two document collaboration architectures for an AI-assis
 
 ### Approach B: Canonical Markdown
 - Source of truth is a Markdown string stored in memory.
-- Tiptap renders Markdown via `tiptap-markdown`.
-- Human edits convert back to Markdown via `editor.storage.markdown.getMarkdown()` on debounce.
+- Tiptap renders Markdown via `@tiptap/markdown`.
+- Human edits convert back to Markdown via `editor.getMarkdown()` on debounce.
 - AI edits Markdown and the UI rehydrates from it.
 
 ## Run locally

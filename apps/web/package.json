@@ -13,6 +13,7 @@
     "@tiptap/core": "^3.0.1",
     "@tiptap/extension-bullet-list": "^3.0.1",
     "@tiptap/extension-code-block": "^3.0.1",
+    "@tiptap/extension-collaboration": "^3.0.0",
     "@tiptap/extension-document": "^3.0.1",
     "@tiptap/extension-heading": "^3.0.1",
     "@tiptap/extension-history": "^3.0.1",
@@ -26,16 +27,15 @@
     "@tiptap/extension-text": "^3.0.1",
     "@tiptap/extension-text-style": "^3.0.1",
     "@tiptap/extension-underline": "^3.0.1",
+    "@tiptap/markdown": "^3.14.0",
     "@tiptap/react": "^3.0.1",
     "@tiptap/starter-kit": "^3.0.1",
-    "tiptap-markdown": "^0.9.0",
     "marked": "^12.0.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "turndown": "^7.1.2",
     "turndown-plugin-gfm": "^1.0.2",
-    "yjs": "^13.6.14",
-    "@tiptap/extension-collaboration": "^3.0.0"
+    "yjs": "^13.6.14"
   },
   "devDependencies": {
     "@types/react": "^18.3.3",
