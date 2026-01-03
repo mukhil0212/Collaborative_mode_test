@@ -41,10 +41,12 @@ except ImportError:
     ModelSettings = None
 
 app = FastAPI()
+allowed_origins_env = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:5173")
+allowed_origins = [origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -135,8 +137,9 @@ if Agent and document_edit_response:
         tool_use_behavior="stop_on_first_tool",
     )
 
-# Store input items per session so chat can reuse history.
+# Store compact chat history per session to avoid unbounded prompt growth.
 SESSION_INPUTS: Dict[str, list[Dict[str, Any]]] = {}
+MAX_SESSION_ITEMS = 12
 ALLOWED_OPS = (
     "Allowed ops (array of objects, use JSON with double quotes):\n"
     "- append_markdown: { \"op\": \"append_markdown\", \"markdown\": \"...\" }\n"
@@ -185,6 +188,30 @@ def normalize_agent_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "ops": ops,
         "markdown": cleaned_text(payload.get("markdown")),
     }
+
+
+def validate_ops(ops: list[Dict[str, Any]]) -> tuple[bool, Optional[str]]:
+    """Light validation to reject malformed ops."""
+    allowed = {"append_markdown", "replace_section_by_heading", "insert_after_heading"}
+    for op in ops:
+        op_type = op.get("op")
+        if op_type not in allowed:
+            return False, f"Invalid op type: {op_type}"
+        if not cleaned_text(op.get("markdown")):
+            return False, "Missing markdown in op"
+        if op_type != "append_markdown" and not cleaned_text(op.get("heading")):
+            return False, "Missing heading in op"
+    return True, None
+
+
+def trim_session_items(items: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    """Keep only the last N compact chat items."""
+    compact = [
+        {"role": item.get("role"), "content": item.get("content")}
+        for item in items
+        if isinstance(item.get("role"), str) and isinstance(item.get("content"), str)
+    ]
+    return compact[-MAX_SESSION_ITEMS:]
 
 def stringify_content(content: Any) -> str:
     """Convert content to a prompt-safe string."""
@@ -382,6 +409,10 @@ async def edit(request: EditRequest) -> EditResponse:
         markdown = normalized["markdown"] if mode == 'B' else None
         if mode == 'A' and not ops:
             raise HTTPException(status_code=502, detail="Agent edit returned no ops")
+        if ops:
+            valid, error = validate_ops(ops)
+            if not valid:
+                raise HTTPException(status_code=502, detail=error or "Invalid ops payload")
         if mode == 'B' and not markdown:
             raise HTTPException(status_code=502, detail="Agent edit returned no markdown")
         return EditResponse(
@@ -410,7 +441,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         content = ''
 
     session_id = request.sessionId or "default"
-    input_items = SESSION_INPUTS.get(session_id)
+    input_items = SESSION_INPUTS.get(session_id, [])
     payload, result = await run_agent(
         kind='chat',
         mode=mode,
@@ -421,12 +452,19 @@ async def chat(request: ChatRequest) -> ChatResponse:
         input_items=input_items,
     )
     if payload:
-        if result is not None:
-            SESSION_INPUTS[session_id] = result.to_input_list()
         normalized = normalize_agent_payload(payload)
+        if result is not None:
+            next_items = input_items + [{"role": "user", "content": request.message}]
+            reply_text = normalized["reply"] or ("Applied the edit." if normalized["ops"] or normalized["markdown"] else "Okay.")
+            next_items.append({"role": "assistant", "content": reply_text})
+            SESSION_INPUTS[session_id] = trim_session_items(next_items)
         ops = normalized["ops"] if mode == 'A' else None
         markdown = normalized["markdown"] if mode == 'B' else None
         reply = normalized["reply"] or ("Applied the edit." if ops or markdown else "Okay.")
+        if ops:
+            valid, error = validate_ops(ops)
+            if not valid:
+                raise HTTPException(status_code=502, detail=error or "Invalid ops payload")
         return ChatResponse(
             reply=reply,
             summary=normalized["summary"] or None,
