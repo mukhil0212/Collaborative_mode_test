@@ -32,6 +32,7 @@ else:
     print("OPENAI_API_KEY missing after .env load.")
 
 try:
+    # Agents SDK is optional; endpoints degrade gracefully if unavailable.
     from agents import Agent, Runner, function_tool, ModelSettings  # OpenAI Agents SDK
 except ImportError:
     Agent = None
@@ -134,6 +135,7 @@ if Agent and document_edit_response:
         tool_use_behavior="stop_on_first_tool",
     )
 
+# Store input items per session so chat can reuse history.
 SESSION_INPUTS: Dict[str, list[Dict[str, Any]]] = {}
 ALLOWED_OPS = (
     "Allowed ops (array of objects, use JSON with double quotes):\n"
@@ -142,35 +144,39 @@ ALLOWED_OPS = (
     "- insert_after_heading: { \"op\": \"insert_after_heading\", \"heading\": \"Section Title\", \"level\": 2, \"markdown\": \"...\" }\n\n"
 )
 
-def is_tiptap_doc(value: Any) -> bool:
-    return isinstance(value, dict) and value.get("type") == "doc"
-
-
 def cleaned_text(value: Any) -> Optional[str]:
+    """Return trimmed text or None if empty."""
     if isinstance(value, str) and value.strip():
         return value
     return None
 
 
-def parse_ops_json(value: Any) -> Optional[list[Dict[str, Any]]]:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        decoded = json.loads(value)
-    except json.JSONDecodeError:
-        return None
-    return coerce_ops(decoded)
-
-
 def coerce_ops(value: Any) -> Optional[list[Dict[str, Any]]]:
+    """Ensure ops is a list of dicts."""
     if not isinstance(value, list):
         return None
     ops = [item for item in value if isinstance(item, dict)]
     return ops or None
 
 
+def parse_ops(value: Any) -> Optional[list[Dict[str, Any]]]:
+    """Parse ops from JSON string or list."""
+    # Accept ops as either a JSON string or a list of dicts.
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return coerce_ops(decoded)
+    return coerce_ops(value)
+
+
 def normalize_agent_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    ops = parse_ops_json(payload.get("opsJson")) or coerce_ops(payload.get("ops"))
+    """Normalize tool output into API response fields."""
+    # Normalize tool output into consistent fields for API responses.
+    ops = parse_ops(payload.get("opsJson")) or parse_ops(payload.get("ops"))
     return {
         "summary": cleaned_text(payload.get("summary")) or '',
         "ack": cleaned_text(payload.get("ack")) or '',
@@ -181,6 +187,8 @@ def normalize_agent_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 def stringify_content(content: Any) -> str:
+    """Convert content to a prompt-safe string."""
+    # Ensure the prompt always gets a string representation.
     if isinstance(content, (dict, list)):
         try:
             return json.dumps(content, ensure_ascii=True)
@@ -192,6 +200,8 @@ def stringify_content(content: Any) -> str:
 
 
 def extract_tool_payload(result: Any) -> Optional[Dict[str, Any]]:
+    """Extract the tool output payload from an Agents SDK result."""
+    # Prefer final output; fall back to tool call outputs and raw response items.
     final_output = getattr(result, "final_output", None)
     if isinstance(final_output, dict):
         return final_output
@@ -254,6 +264,7 @@ def build_prompt(
     instruction_text: str,
     message: str,
 ) -> str:
+    """Build the system prompt for edit or chat mode."""
     if kind == 'edit':
         return (
             "You are editing an employee onboarding document. "
@@ -303,6 +314,7 @@ async def run_agent(
     message: str = '',
     input_items: Optional[list[Dict[str, Any]]] = None,
 ) -> tuple[Optional[Dict[str, Any]], Optional[Any]]:
+    """Run the agent with optional session input items."""
     if AGENT is None or Runner is None:
         return None, None
     if not os.getenv('OPENAI_API_KEY'):
