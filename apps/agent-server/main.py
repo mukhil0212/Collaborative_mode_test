@@ -54,6 +54,8 @@ class EditRequest(BaseModel):
     markdown: Optional[str] = None
     recentRevision: Optional[str] = ''
     instruction: Optional[str] = ''
+    baseHash: Optional[str] = None
+    schemaHints: Optional[str] = None
 
 
 class EditResponse(BaseModel):
@@ -63,6 +65,8 @@ class EditResponse(BaseModel):
     docJson: Optional[Dict[str, Any]] = None
     markdown: Optional[str] = None
     reply: Optional[str] = None
+    ops: Optional[list[Dict[str, Any]]] = None
+    baseHash: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
@@ -72,6 +76,8 @@ class ChatRequest(BaseModel):
     docJson: Optional[Dict[str, Any]] = None
     markdown: Optional[str] = None
     sessionId: Optional[str] = None
+    baseHash: Optional[str] = None
+    schemaHints: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -81,6 +87,8 @@ class ChatResponse(BaseModel):
     docJson: Optional[Dict[str, Any]] = None
     markdown: Optional[str] = None
     sessionId: Optional[str] = None
+    ops: Optional[list[Dict[str, Any]]] = None
+    baseHash: Optional[str] = None
 
 
 AGENT = Agent(
@@ -112,7 +120,14 @@ def stringify_content(content: Any) -> str:
     return str(content)
 
 
-async def run_agent_edit(mode: str, content: str, recent_revision: str, instruction: str) -> Optional[EditResponse]:
+async def run_agent_edit(
+    mode: str,
+    content: Any,
+    recent_revision: str,
+    instruction: str,
+    base_hash: Optional[str] = None,
+    schema_hints: Optional[str] = None,
+) -> Optional[EditResponse]:
     if Agent is None or Runner is None:
         return None
     if not os.getenv('OPENAI_API_KEY'):
@@ -122,13 +137,21 @@ async def run_agent_edit(mode: str, content: str, recent_revision: str, instruct
     content_text = stringify_content(content)
     if mode == 'A':
         print(f"Mode A edit content JSON length: {len(content_text)}")
+    schema_text = schema_hints or ''
     prompt = (
         "You are editing an employee onboarding document. "
-        "Return JSON with keys: summary, ack, reply, docJson, html, markdown. "
-        "If mode is A, only fill docJson (preferred) or html. If mode is B, only fill markdown. "
-        "If mode is A, the content below is JSON.\n\n"
+        "Return JSON with keys: summary, ack, reply, baseHash, ops. "
+        "If mode is A, return ops only (no docJson/html/markdown). "
+        "If mode is B, return markdown edits (no ops). "
+        "If mode is A, the content below is Markdown and ops must target that document.\n\n"
+        "Allowed ops (array of objects, use JSON with double quotes):\n"
+        "- append_markdown: { \"op\": \"append_markdown\", \"markdown\": \"...\" }\n"
+        "- replace_section_by_heading: { \"op\": \"replace_section_by_heading\", \"heading\": \"Section Title\", \"level\": 2, \"markdown\": \"...\" }\n"
+        "- insert_after_heading: { \"op\": \"insert_after_heading\", \"heading\": \"Section Title\", \"level\": 2, \"markdown\": \"...\" }\n\n"
         "Acknowledge the recent revision string in ack. "
         "Make a deterministic edit based on the instruction.\n\n"
+        f"Base hash (echo back): {base_hash or ''}\n"
+        f"Schema hints: {schema_text}\n\n"
         f"Mode: {mode}\n"
         f"Recent revision: {recent_revision}\n\n"
         f"Instruction: {instruction_text}\n\n"
@@ -141,6 +164,9 @@ async def run_agent_edit(mode: str, content: str, recent_revision: str, instruct
         json_payload = payload.get('docJson')
         if not is_tiptap_doc(json_payload):
             json_payload = None
+        ops_payload = payload.get('ops')
+        if not isinstance(ops_payload, list):
+            ops_payload = None
         return EditResponse(
             summary=payload.get('summary', 'AI edit'),
             ack=payload.get('ack', ''),
@@ -148,12 +174,21 @@ async def run_agent_edit(mode: str, content: str, recent_revision: str, instruct
             html=cleaned_text(payload.get('html')),
             docJson=json_payload,
             markdown=cleaned_text(payload.get('markdown')),
+            ops=ops_payload,
+            baseHash=payload.get('baseHash'),
         )
     except json.JSONDecodeError:
         return None
 
 
-async def run_agent_chat(mode: str, message: str, content: str, session_id: str) -> Optional[ChatResponse]:
+async def run_agent_chat(
+    mode: str,
+    message: str,
+    content: Any,
+    session_id: str,
+    base_hash: Optional[str] = None,
+    schema_hints: Optional[str] = None,
+) -> Optional[ChatResponse]:
     if Agent is None or Runner is None:
         return None
     if not os.getenv('OPENAI_API_KEY'):
@@ -164,14 +199,22 @@ async def run_agent_chat(mode: str, message: str, content: str, session_id: str)
     content_text = stringify_content(content)
     if mode == 'A':
         print(f"Mode A chat content JSON length: {len(content_text)}")
+    schema_text = schema_hints or ''
     prompt = (
         "You are assisting with an employee onboarding document. "
-        "Return JSON with keys: summary, reply, docJson, html, markdown. "
-        "If the user is just chatting (e.g., greetings, questions), do NOT edit and leave docJson/html/markdown empty. "
+        "Return JSON with keys: summary, reply, baseHash, ops, markdown. "
+        "If the user is just chatting (e.g., greetings, questions), do NOT edit and leave ops/markdown empty. "
         "Only edit when the user clearly requests a change to the document. "
-        "If mode is A, only fill docJson (preferred) or html. If mode is B, only fill markdown. "
-        "If mode is A, the content below is JSON.\n\n"
+        "If mode is A, return ops only (no docJson/html/markdown). "
+        "If mode is B, return markdown edits (no ops). "
+        "If mode is A, the content below is Markdown and ops must target that document.\n\n"
+        "Allowed ops (array of objects, use JSON with double quotes):\n"
+        "- append_markdown: { \"op\": \"append_markdown\", \"markdown\": \"...\" }\n"
+        "- replace_section_by_heading: { \"op\": \"replace_section_by_heading\", \"heading\": \"Section Title\", \"level\": 2, \"markdown\": \"...\" }\n"
+        "- insert_after_heading: { \"op\": \"insert_after_heading\", \"heading\": \"Section Title\", \"level\": 2, \"markdown\": \"...\" }\n\n"
         "Reply conversationally and briefly in reply.\n\n"
+        f"Base hash (echo back): {base_hash or ''}\n"
+        f"Schema hints: {schema_text}\n\n"
         f"Conversation so far:\n{formatted_history}\n\n"
         f"Mode: {mode}\n"
         f"Message: {message}\n\n"
@@ -184,12 +227,17 @@ async def run_agent_chat(mode: str, message: str, content: str, session_id: str)
         json_payload = payload.get('docJson')
         if not is_tiptap_doc(json_payload):
             json_payload = None
+        ops_payload = payload.get('ops')
+        if not isinstance(ops_payload, list):
+            ops_payload = None
         response = ChatResponse(
             reply=payload.get('reply', '').strip() or 'Done.',
             summary=payload.get('summary', 'AI edit'),
             html=cleaned_text(payload.get('html')),
             docJson=json_payload,
             markdown=cleaned_text(payload.get('markdown')),
+            ops=ops_payload,
+            baseHash=payload.get('baseHash'),
             sessionId=session_id,
         )
         return response
@@ -204,7 +252,11 @@ async def edit(request: EditRequest) -> EditResponse:
         mode = 'A'
 
     if mode == 'A':
-        content = request.docJson if request.docJson is not None else request.html or ''
+        content = (
+            request.markdown
+            if request.markdown is not None
+            else request.docJson if request.docJson is not None else request.html or ''
+        )
     else:
         content = request.markdown
     if content is None:
@@ -214,7 +266,9 @@ async def edit(request: EditRequest) -> EditResponse:
         mode,
         content,
         request.recentRevision or '',
-        request.instruction or ''
+        request.instruction or '',
+        request.baseHash,
+        request.schemaHints,
     )
     if agent_response:
         return agent_response
@@ -225,7 +279,11 @@ async def edit(request: EditRequest) -> EditResponse:
 async def chat(request: ChatRequest) -> ChatResponse:
     mode = (request.mode or 'A').upper()
     if mode == 'A':
-        content = request.docJson if request.docJson is not None else request.html or ''
+        content = (
+            request.markdown
+            if request.markdown is not None
+            else request.docJson if request.docJson is not None else request.html or ''
+        )
     else:
         content = request.markdown
     if content is None:
@@ -234,7 +292,14 @@ async def chat(request: ChatRequest) -> ChatResponse:
     session_id = request.sessionId or "default"
     CHAT_SESSIONS.setdefault(session_id, []).append({"role": "user", "text": request.message})
 
-    agent_response = await run_agent_chat(mode, request.message, content, session_id)
+    agent_response = await run_agent_chat(
+        mode,
+        request.message,
+        content,
+        session_id,
+        request.baseHash,
+        request.schemaHints,
+    )
     if agent_response:
         CHAT_SESSIONS.setdefault(session_id, []).append({"role": "assistant", "text": agent_response.reply})
         return agent_response

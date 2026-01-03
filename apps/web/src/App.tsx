@@ -13,6 +13,7 @@ import type { AnyExtension } from '@tiptap/core'
 import INITIAL_MARKDOWN from './initial-memo.md?raw'
 
 const AGENT_SERVER_URL = import.meta.env.VITE_AGENT_SERVER_URL || 'http://localhost:8787'
+const DEBUG_AI = import.meta.env.DEV
 
 type Approach = 'A' | 'B'
 
@@ -33,7 +34,26 @@ type ChatMessage = {
   timestamp: string
 }
 
+type AiOperation =
+  | {
+      op: 'append_markdown'
+      markdown: string
+    }
+  | {
+      op: 'replace_section_by_heading'
+      heading: string
+      level?: number
+      markdown: string
+    }
+  | {
+      op: 'insert_after_heading'
+      heading: string
+      level?: number
+      markdown: string
+    }
+
 function buildExtensions(approach: Approach, ydoc: Y.Doc | null): AnyExtension[] {
+  // Disable undoRedo when collaborating to avoid conflicts with Yjs.
   const starterKit =
     approach === 'A' ? StarterKit.configure({ undoRedo: false }) : StarterKit
   const extensions = [
@@ -60,15 +80,46 @@ function nowIso() {
   return new Date().toISOString()
 }
 
-function isTiptapDoc(value: unknown): value is { type: string } {
-  return !!value && typeof value === 'object' && (value as { type?: string }).type === 'doc'
-}
-
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
 
+// Stable hash to detect concurrent edits while the AI is working.
+function hashDoc(doc: object): string {
+  const raw = JSON.stringify(doc)
+  let hash = 5381
+  for (let i = 0; i < raw.length; i += 1) {
+    hash = (hash * 33) ^ raw.charCodeAt(i)
+  }
+  return (hash >>> 0).toString(16)
+}
+
+// Keep the AI grounded on supported nodes/marks.
+function schemaHints() {
+  return [
+    'Nodes: doc, paragraph, heading(level 1-6), bulletList, orderedList, listItem, codeBlock, table, tableRow, tableCell, tableHeader.',
+    'Marks: bold, italic, code, strike, link, underline.'
+  ].join(' ')
+}
+
+function toMarkdown(editor: { getMarkdown?: () => string; getText: () => string }) {
+  try {
+    if (typeof editor.getMarkdown === 'function') {
+      return editor.getMarkdown()
+    }
+  } catch {
+    // fall back to text
+  }
+  return editor.getText()
+}
+
 export default function App() {
+  const debug = (...args: unknown[]) => {
+    if (DEBUG_AI) {
+      console.log('[AI]', ...args)
+    }
+  }
+
   const [approach, setApproach] = useState<Approach>('A')
   const [aiRunning, setAiRunning] = useState(false)
   const [revisionLog, setRevisionLog] = useState<RevisionEntry[]>([])
@@ -249,6 +300,95 @@ export default function App() {
     })
   }
 
+  const applyMarkdownAtRange = (from: number, to: number, markdown: string) => {
+    const applied = editor?.commands.insertContentAt(
+      { from, to },
+      markdown,
+      { contentType: 'markdown' } as { contentType: 'markdown' }
+    )
+    if (!applied) {
+      editor?.commands.insertContentAt({ from, to }, markdown)
+    }
+  }
+
+  // Apply AI ops as small patches so we avoid full-document replacement.
+  const applyAiOps = (ops: AiOperation[]) => {
+    if (!editor) return { applied: 0, errors: ['Editor not ready'] }
+
+    let applied = 0
+    const errors: string[] = []
+
+    const readHeadings = () => {
+      const headings: Array<{ pos: number; level: number; text: string; nodeSize: number }> = []
+      editor.state.doc.descendants((node, pos) => {
+        if (node.type.name === 'heading') {
+          const level = typeof node.attrs.level === 'number' ? node.attrs.level : 1
+          headings.push({ pos, level, text: node.textContent.trim(), nodeSize: node.nodeSize })
+        }
+      })
+      return headings
+    }
+
+    ops.forEach((op) => {
+      if (!isNonEmptyString(op.markdown)) {
+        errors.push('Missing markdown in op')
+        return
+      }
+
+      if (op.op === 'append_markdown') {
+        const endPos = editor.state.doc.content.size
+        applyMarkdownAtRange(endPos, endPos, op.markdown)
+        applied += 1
+        return
+      }
+
+      const headingText = op.heading?.trim()
+      if (!headingText) {
+        errors.push('Missing heading in op')
+        return
+      }
+
+      const headings = readHeadings()
+      const target = headings.find((heading) => {
+        if (heading.text !== headingText) return false
+        if (typeof op.level === 'number') {
+          return heading.level === op.level
+        }
+        return true
+      })
+
+      if (!target) {
+        errors.push(`Heading not found: ${headingText}`)
+        return
+      }
+
+      const targetIndex = headings.indexOf(target)
+      const targetLevel = typeof op.level === 'number' ? op.level : target.level
+      const nextHeading = headings
+        .slice(targetIndex + 1)
+        .find((heading) => heading.level <= targetLevel)
+
+      const from = target.pos + target.nodeSize
+      const to = nextHeading ? nextHeading.pos : editor.state.doc.content.size
+
+      if (op.op === 'replace_section_by_heading') {
+        applyMarkdownAtRange(from, to, op.markdown)
+        applied += 1
+        return
+      }
+
+      if (op.op === 'insert_after_heading') {
+        applyMarkdownAtRange(from, from, op.markdown)
+        applied += 1
+        return
+      }
+
+      errors.push(`Unknown op: ${(op as { op: string }).op}`)
+    })
+
+    return { applied, errors }
+  }
+
   const handleAiEdit = async () => {
     if (!editor || aiRunning) return
 
@@ -264,11 +404,18 @@ export default function App() {
     setAiRunning(true)
 
     try {
+      const baseDoc = editor.getJSON()
+      const baseHash = hashDoc(baseDoc)
+      const markdownSnapshot = toMarkdown(editor)
+      debug('edit request', { approach, baseHash, instruction })
       const payload =
         approach === 'A'
           ? {
               mode: 'A',
-              docJson: editor.getJSON(),
+              docJson: baseDoc,
+              markdown: markdownSnapshot,
+              baseHash,
+              schemaHints: schemaHints(),
               recentRevision: revisionLog[0]?.summary || '',
               instruction
             }
@@ -290,23 +437,39 @@ export default function App() {
       }
 
       const data = await response.json()
+      debug('chat response', data)
+      debug('edit response', data)
 
       if (approach === 'A') {
-        const nextDoc = isTiptapDoc(data.docJson) ? data.docJson : null
-        const nextHtml = isNonEmptyString(data.html) ? data.html : null
-        const nextContent = nextDoc ?? nextHtml
-        if (!nextContent) {
-          throw new Error('AI edit returned no content')
+        const ops = Array.isArray(data.ops) ? (data.ops as AiOperation[]) : null
+        const currentHash = hashDoc(editor.getJSON())
+        if (ops) {
+          if (currentHash !== baseHash) {
+            debug('edit skipped: base hash mismatch', { baseHash, currentHash })
+            pushChatMessage({
+              approach,
+              role: 'assistant',
+              text: 'Document changed while the AI was editing. Please retry.',
+              timestamp: nowIso()
+            })
+            return
+          }
+          pushStatusMessage('AI is updating the document...')
+          const result = applyAiOps(ops)
+          debug('edit ops applied', result)
+          if (result.applied === 0) {
+            throw new Error(result.errors[0] || 'AI edit returned no valid ops')
+          }
+          addRevision({
+            approach,
+            actor: 'ai',
+            summary: data.summary || 'AI edit',
+            timestamp: nowIso(),
+            snapshot: editor.getJSON()
+          })
+        } else {
+          throw new Error('AI edit returned no ops')
         }
-        pushStatusMessage('AI is updating the document...')
-        editor.commands.setContent(nextContent, { emitUpdate: false })
-        addRevision({
-          approach,
-          actor: 'ai',
-          summary: data.summary || 'AI edit',
-          timestamp: nowIso(),
-          snapshot: editor.getJSON()
-        })
       } else {
         const nextMarkdown = isNonEmptyString(data.markdown) ? data.markdown : null
         const nextHtml = isNonEmptyString(data.html) ? data.html : null
@@ -322,6 +485,7 @@ export default function App() {
             editor.commands.setContent(markdown, { emitUpdate: false })
           }
           lastAppliedMarkdown.current = markdown
+          debug('edit markdown applied', { applied })
           addRevision({
             approach,
             actor: 'ai',
@@ -382,9 +546,21 @@ export default function App() {
     setAiRunning(true)
 
     try {
+      const baseDoc = editor?.getJSON() ?? {}
+      const baseHash = editor ? hashDoc(baseDoc) : null
+      const markdownSnapshot = editor ? toMarkdown(editor) : ''
+      debug('chat request', { approach, baseHash, message })
       const payload =
         approach === 'A'
-          ? { mode: 'A', message, docJson: editor?.getJSON() || {}, sessionId: chatSessionId }
+          ? {
+              mode: 'A',
+              message,
+              docJson: baseDoc,
+              markdown: markdownSnapshot,
+              baseHash,
+              schemaHints: schemaHints(),
+              sessionId: chatSessionId
+            }
           : { mode: 'B', message, markdown: canonicalMarkdown, sessionId: chatSessionId }
 
       const response = await fetch(`${AGENT_SERVER_URL}/chat`, {
@@ -399,20 +575,40 @@ export default function App() {
 
       const data = await response.json()
 
-      if (approach === 'A' && (data.docJson || data.html || data.markdown)) {
-        const nextDoc = isTiptapDoc(data.docJson) ? data.docJson : null
-        const nextHtml = isNonEmptyString(data.html) ? data.html : null
-        const nextMarkdown = isNonEmptyString(data.markdown) ? data.markdown : null
-        const nextContent = nextDoc ?? nextHtml ?? nextMarkdown
-        if (nextContent && editor) {
-          pushStatusMessage('AI is updating the document...')
-          editor.commands.setContent(nextContent, { emitUpdate: false })
-          addRevision({
+      if (approach === 'A' && editor) {
+        const ops = Array.isArray(data.ops) ? (data.ops as AiOperation[]) : null
+        const currentHash = hashDoc(editor.getJSON())
+        const baseMatches = baseHash ? currentHash === baseHash : true
+
+        if (ops) {
+          if (!baseMatches) {
+            debug('chat skipped: base hash mismatch', { baseHash, currentHash })
+            pushChatMessage({
+              approach,
+              role: 'assistant',
+              text: 'Document changed while the AI was editing. Please retry.',
+              timestamp: nowIso()
+            })
+          } else {
+            pushStatusMessage('AI is updating the document...')
+            const result = applyAiOps(ops)
+            debug('chat ops applied', result)
+            if (result.applied > 0) {
+              addRevision({
+                approach,
+                actor: 'ai',
+                summary: data.summary || 'AI edit',
+                timestamp: nowIso(),
+                snapshot: editor.getJSON()
+              })
+            }
+          }
+        } else if (data.markdown || data.docJson || data.html) {
+          pushChatMessage({
             approach,
-            actor: 'ai',
-            summary: data.summary || 'AI edit',
-            timestamp: nowIso(),
-            snapshot: editor.getJSON()
+            role: 'assistant',
+            text: 'AI did not return ops. Please retry.',
+            timestamp: nowIso()
           })
         }
       }
@@ -430,10 +626,12 @@ export default function App() {
             if (!applied || editor.isEmpty) {
               editor.commands.setContent(nextMarkdown, { emitUpdate: false })
             }
+            debug('chat markdown applied', { applied })
           }
         } else if (nextHtml && editor) {
           pushStatusMessage('AI is updating the document...')
           editor.commands.setContent(nextHtml, { emitUpdate: false, contentType: 'html' })
+          debug('chat html applied')
         }
         if (editor) {
           const markdown = normalizeMarkdown(editor.getMarkdown())
