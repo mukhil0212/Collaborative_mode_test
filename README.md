@@ -19,8 +19,14 @@ This repo compares two document collaboration approaches for AI‑assisted editi
 - Tiptap renders from Markdown; AI edits Markdown.
 - Simpler data model, but no real‑time multi‑human sync without extra work.
 
+
 ## UI mode note
 You don’t need separate edit/preview modes. A simple “AI lock” (disable human edits while the agent is applying changes) is enough to prevent conflicts without adding mode complexity.
 
 ## Recommendation
 I think Approach A is the better default if you want live multi‑human collaboration plus AI edits. It keeps the ProseMirror/Yjs state canonical, applies structured ops safely, and detects conflicts. Approach B is simpler for single‑user or AI‑only workflows, but it doesn’t handle concurrent human edits well without extra machinery.
+## Minimal setup
+1) Install deps: `cd apps/web && npm install` and `cd ../agent-server && pip install -r requirements.txt`
+2) Start servers: `python main.py` (agent) and `npm run dev` (web)
+3) Open: `http://localhost:5173`
+Note: Web runs on Vite, server is Python (FastAPI), and the agent uses the OpenAI Agents SDK.
