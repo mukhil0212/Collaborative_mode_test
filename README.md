@@ -1,10 +1,10 @@
 # Minimal bake-off: Tiptap collaboration + Agents SDK editing
 
-This repo compares two document collaboration approaches for AI‑assisted editing and shows why full‑document replacement is risky when humans and AI edit the same file.
+This repo compares two document collaboration approaches for AI‑assisted editing and demonstrates ops‑based updates with an AI lock to avoid stale, full‑document replacement.
 
 ## The problem this solves
-- AI edits should not wipe recent human edits.
-- Edits should be mergeable and schema‑safe.
+- AI edits should not overwrite recent human edits (base hash + AI lock).
+- Edits should be mergeable and schema‑safe (structured ops).
 - The UI should stay responsive while the agent makes changes.
 
 ## The two approaches
