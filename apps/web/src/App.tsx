@@ -1,14 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { EditorContent, useEditor } from '@tiptap/react'
 import { StarterKit } from '@tiptap/starter-kit'
-import { Document } from '@tiptap/extension-document'
-import { Paragraph } from '@tiptap/extension-paragraph'
-import { Text } from '@tiptap/extension-text'
-import { Heading } from '@tiptap/extension-heading'
-import { BulletList } from '@tiptap/extension-bullet-list'
-import { OrderedList } from '@tiptap/extension-ordered-list'
-import { ListItem } from '@tiptap/extension-list-item'
-import { CodeBlock } from '@tiptap/extension-code-block'
 import { Table } from '@tiptap/extension-table'
 import { TableRow } from '@tiptap/extension-table-row'
 import { TableHeader } from '@tiptap/extension-table-header'
@@ -42,27 +34,11 @@ type ChatMessage = {
 }
 
 function buildExtensions(approach: Approach, ydoc: Y.Doc | null): AnyExtension[] {
-  if (approach === 'B') {
-    return [
-      Markdown,
-      StarterKit,
-      Table.configure({ resizable: true }),
-      TableRow,
-      TableHeader,
-      TableCell
-    ] as AnyExtension[]
-  }
-
+  const starterKit =
+    approach === 'A' ? StarterKit.configure({ undoRedo: false }) : StarterKit
   const extensions = [
-    Document,
-    Paragraph,
-    Text,
-    Heading,
-    BulletList,
-    OrderedList,
-    ListItem,
-    CodeBlock,
     Markdown,
+    starterKit,
     Table.configure({ resizable: true }),
     TableRow,
     TableHeader,
@@ -101,14 +77,12 @@ export default function App() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [chatInput, setChatInput] = useState('')
   const [chatRunning, setChatRunning] = useState(false)
-  const [previewMode, setPreviewMode] = useState(true)
   const [chatSessionId] = useState(() => `session-${Date.now()}-${Math.random().toString(16).slice(2)}`)
   const debounceRef = useRef<number | null>(null)
   const lastAppliedMarkdown = useRef<string | null>(null)
   const lastSavedJson = useRef<string | null>(null)
   const canonicalMarkdownRef = useRef(canonicalMarkdown)
   const aiRunningRef = useRef(aiRunning)
-  const previewModeRef = useRef(previewMode)
 
   const ydoc = useMemo(() => (approach === 'A' ? new Y.Doc() : null), [approach])
 
@@ -118,7 +92,7 @@ export default function App() {
       content: approach === 'B' ? canonicalMarkdown : '',
       contentType: approach === 'B' ? 'markdown' : undefined,
       onUpdate: ({ editor }) => {
-        if (approach !== 'B' || aiRunningRef.current || previewModeRef.current) return
+        if (approach !== 'B' || aiRunningRef.current) return
         if (debounceRef.current) {
           window.clearTimeout(debounceRef.current)
         }
@@ -159,19 +133,15 @@ export default function App() {
 
   useEffect(() => {
     if (!editor) return
-    if (approach === 'B') {
-      editor.setEditable(!aiRunning && !previewMode)
-    } else {
-      editor.setEditable(!aiRunning)
-    }
-  }, [aiRunning, editor, approach, previewMode])
+    editor.setEditable(!aiRunning)
+  }, [aiRunning, editor])
 
   useEffect(() => {
     if (!editor) return
     if (approach === 'A' && editor.isEmpty) {
       editor.commands.setContent(INITIAL_MARKDOWN, { emitUpdate: false, contentType: 'markdown' })
     }
-    if (approach === 'B' && (previewMode || editor.isEmpty)) {
+    if (approach === 'B' && editor.isEmpty) {
       if (lastAppliedMarkdown.current !== canonicalMarkdown) {
         const applied = editor.commands.setContent(canonicalMarkdown, {
           emitUpdate: false,
@@ -183,7 +153,7 @@ export default function App() {
         lastAppliedMarkdown.current = canonicalMarkdown
       }
     }
-  }, [approach, editor, canonicalMarkdown, previewMode])
+  }, [approach, editor, canonicalMarkdown])
 
   useEffect(() => {
     canonicalMarkdownRef.current = canonicalMarkdown
@@ -192,10 +162,6 @@ export default function App() {
   useEffect(() => {
     aiRunningRef.current = aiRunning
   }, [aiRunning])
-
-  useEffect(() => {
-    previewModeRef.current = previewMode
-  }, [previewMode])
 
   useEffect(() => {
     return () => {
@@ -212,7 +178,6 @@ export default function App() {
     setLastSyncAt(null)
     setChatMessages([])
     setChatInput('')
-    setPreviewMode(true)
     lastAppliedMarkdown.current = null
     lastSavedJson.current = null
     if (debounceRef.current) {
@@ -275,6 +240,15 @@ export default function App() {
     ])
   }
 
+  const pushStatusMessage = (text: string) => {
+    pushChatMessage({
+      approach,
+      role: 'assistant',
+      text,
+      timestamp: nowIso()
+    })
+  }
+
   const handleAiEdit = async () => {
     if (!editor || aiRunning) return
 
@@ -324,6 +298,7 @@ export default function App() {
         if (!nextContent) {
           throw new Error('AI edit returned no content')
         }
+        pushStatusMessage('AI is updating the document...')
         editor.commands.setContent(nextContent, { emitUpdate: false })
         addRevision({
           approach,
@@ -336,6 +311,7 @@ export default function App() {
         const nextMarkdown = isNonEmptyString(data.markdown) ? data.markdown : null
         const nextHtml = isNonEmptyString(data.html) ? data.html : null
         if (nextMarkdown) {
+          pushStatusMessage('AI is updating the document...')
           const markdown = normalizeMarkdown(nextMarkdown)
           setCanonicalMarkdown(markdown)
           const applied = editor.commands.setContent(markdown, {
@@ -354,6 +330,7 @@ export default function App() {
             snapshot: markdown
           })
         } else if (nextHtml) {
+          pushStatusMessage('AI is updating the document...')
           editor.commands.setContent(nextHtml, { emitUpdate: false, contentType: 'html' })
           const markdown = normalizeMarkdown(editor.getMarkdown())
           setCanonicalMarkdown(markdown)
@@ -421,26 +398,21 @@ export default function App() {
       }
 
       const data = await response.json()
-      pushChatMessage({
-        approach,
-        role: 'assistant',
-        text: data.reply || 'No reply',
-        timestamp: nowIso()
-      })
 
       if (approach === 'A' && (data.docJson || data.html || data.markdown)) {
         const nextDoc = isTiptapDoc(data.docJson) ? data.docJson : null
         const nextHtml = isNonEmptyString(data.html) ? data.html : null
         const nextMarkdown = isNonEmptyString(data.markdown) ? data.markdown : null
         const nextContent = nextDoc ?? nextHtml ?? nextMarkdown
-        if (nextContent) {
-          editor?.commands.setContent(nextContent, { emitUpdate: false })
+        if (nextContent && editor) {
+          pushStatusMessage('AI is updating the document...')
+          editor.commands.setContent(nextContent, { emitUpdate: false })
           addRevision({
             approach,
             actor: 'ai',
             summary: data.summary || 'AI edit',
             timestamp: nowIso(),
-            snapshot: editor?.getJSON()
+            snapshot: editor.getJSON()
           })
         }
       }
@@ -450,6 +422,7 @@ export default function App() {
         const nextHtml = isNonEmptyString(data.html) ? data.html : null
         if (nextMarkdown) {
           if (editor) {
+            pushStatusMessage('AI is updating the document...')
             const applied = editor.commands.setContent(nextMarkdown, {
               emitUpdate: false,
               contentType: 'markdown'
@@ -458,8 +431,9 @@ export default function App() {
               editor.commands.setContent(nextMarkdown, { emitUpdate: false })
             }
           }
-        } else if (nextHtml) {
-          editor?.commands.setContent(nextHtml, { emitUpdate: false, contentType: 'html' })
+        } else if (nextHtml && editor) {
+          pushStatusMessage('AI is updating the document...')
+          editor.commands.setContent(nextHtml, { emitUpdate: false, contentType: 'html' })
         }
         if (editor) {
           const markdown = normalizeMarkdown(editor.getMarkdown())
@@ -474,6 +448,13 @@ export default function App() {
           })
         }
       }
+
+      pushChatMessage({
+        approach,
+        role: 'assistant',
+        text: data.reply || 'No reply',
+        timestamp: nowIso()
+      })
     } catch (error) {
       pushChatMessage({
         approach,
@@ -515,11 +496,7 @@ export default function App() {
       <section className="controls">
         <div className="mode">
           <span className={aiRunning ? 'pill running' : 'pill'}>
-            {aiRunning
-              ? 'AI mode (locked)'
-              : approach === 'B' && previewMode
-                ? 'Preview mode'
-                : 'Edit mode'}
+            {aiRunning ? 'AI mode (locked)' : 'Edit mode'}
           </span>
           {approach === 'B' && lastSyncAt && (
             <span className="note">Canonical markdown synced: {new Date(lastSyncAt).toLocaleTimeString()}</span>
@@ -537,32 +514,6 @@ export default function App() {
           <EditorContent editor={editor} />
         </div>
         <aside>
-          {approach === 'B' && (
-            <div className="panel">
-              <h2>Mode</h2>
-              <div className="toggle-row">
-                <button
-                  className={previewMode ? 'active' : ''}
-                  onClick={() => setPreviewMode(true)}
-                  disabled={aiRunning}
-                >
-                  Preview
-                </button>
-                <button
-                  className={!previewMode ? 'active' : ''}
-                  onClick={() => setPreviewMode(false)}
-                  disabled={aiRunning}
-                >
-                  Edit
-                </button>
-              </div>
-              <p className="muted">
-                {previewMode
-                  ? 'Preview is read-only.'
-                  : 'Edit mode updates canonical markdown on debounce.'}
-              </p>
-            </div>
-          )}
           <div className="panel">
             <h2>Revision Log</h2>
             {revisionLog.length === 0 && <p className="muted">No revisions yet.</p>}

@@ -101,6 +101,17 @@ def cleaned_text(value: Any) -> Optional[str]:
     return None
 
 
+def stringify_content(content: Any) -> str:
+    if isinstance(content, (dict, list)):
+        try:
+            return json.dumps(content, ensure_ascii=True)
+        except TypeError:
+            return str(content)
+    if content is None:
+        return ''
+    return str(content)
+
+
 async def run_agent_edit(mode: str, content: str, recent_revision: str, instruction: str) -> Optional[EditResponse]:
     if Agent is None or Runner is None:
         return None
@@ -108,16 +119,20 @@ async def run_agent_edit(mode: str, content: str, recent_revision: str, instruct
         return None
 
     instruction_text = instruction.strip() or 'Add a Tips for Success section with three helpful onboarding tips.'
+    content_text = stringify_content(content)
+    if mode == 'A':
+        print(f"Mode A edit content JSON length: {len(content_text)}")
     prompt = (
         "You are editing an employee onboarding document. "
         "Return JSON with keys: summary, ack, reply, docJson, html, markdown. "
         "If mode is A, only fill docJson (preferred) or html. If mode is B, only fill markdown. "
+        "If mode is A, the content below is JSON.\n\n"
         "Acknowledge the recent revision string in ack. "
         "Make a deterministic edit based on the instruction.\n\n"
         f"Mode: {mode}\n"
         f"Recent revision: {recent_revision}\n\n"
         f"Instruction: {instruction_text}\n\n"
-        f"Content:\n{content}"
+        f"Content:\n{content_text}"
     )
 
     result = await Runner.run(AGENT, input=prompt)
@@ -146,17 +161,21 @@ async def run_agent_chat(mode: str, message: str, content: str, session_id: str)
 
     history = CHAT_SESSIONS.get(session_id, [])
     formatted_history = "\n".join([f"{item['role']}: {item['text']}" for item in history][-12:])
+    content_text = stringify_content(content)
+    if mode == 'A':
+        print(f"Mode A chat content JSON length: {len(content_text)}")
     prompt = (
         "You are assisting with an employee onboarding document. "
         "Return JSON with keys: summary, reply, docJson, html, markdown. "
         "If the user is just chatting (e.g., greetings, questions), do NOT edit and leave docJson/html/markdown empty. "
         "Only edit when the user clearly requests a change to the document. "
         "If mode is A, only fill docJson (preferred) or html. If mode is B, only fill markdown. "
+        "If mode is A, the content below is JSON.\n\n"
         "Reply conversationally and briefly in reply.\n\n"
         f"Conversation so far:\n{formatted_history}\n\n"
         f"Mode: {mode}\n"
         f"Message: {message}\n\n"
-        f"Content:\n{content}"
+        f"Content:\n{content_text}"
     )
 
     result = await Runner.run(AGENT, input=prompt)
@@ -185,10 +204,10 @@ async def edit(request: EditRequest) -> EditResponse:
         mode = 'A'
 
     if mode == 'A':
-        content = request.docJson or request.html or ''
+        content = request.docJson if request.docJson is not None else request.html or ''
     else:
         content = request.markdown
-    if not content:
+    if content is None:
         content = ''
 
     agent_response = await run_agent_edit(
@@ -206,10 +225,10 @@ async def edit(request: EditRequest) -> EditResponse:
 async def chat(request: ChatRequest) -> ChatResponse:
     mode = (request.mode or 'A').upper()
     if mode == 'A':
-        content = request.docJson or request.html or ''
+        content = request.docJson if request.docJson is not None else request.html or ''
     else:
         content = request.markdown
-    if not content:
+    if content is None:
         content = ''
 
     session_id = request.sessionId or "default"
