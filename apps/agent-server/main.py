@@ -81,6 +81,7 @@ class ChatRequest(BaseModel):
     docJson: Optional[Dict[str, Any]] = None
     markdown: Optional[str] = None
     sessionId: Optional[str] = None
+    recentRevision: Optional[str] = ''
     baseHash: Optional[str] = None
     schemaHints: Optional[str] = None
 
@@ -143,8 +144,14 @@ MAX_SESSION_ITEMS = 12
 ALLOWED_OPS = (
     "Allowed ops (array of objects, use JSON with double quotes):\n"
     "- append_markdown: { \"op\": \"append_markdown\", \"markdown\": \"...\" }\n"
+    "- rename_heading: { \"op\": \"rename_heading\", \"heading\": \"Old Title\", \"newHeading\": \"New Title\", \"level\": 2 }\n"
+    "- delete_section: { \"op\": \"delete_section\", \"heading\": \"Section Title\", \"level\": 2 }\n"
     "- replace_section_by_heading: { \"op\": \"replace_section_by_heading\", \"heading\": \"Section Title\", \"level\": 2, \"markdown\": \"...\" }\n"
     "- insert_after_heading: { \"op\": \"insert_after_heading\", \"heading\": \"Section Title\", \"level\": 2, \"markdown\": \"...\" }\n\n"
+    "Rules:\n"
+    "- Use rename_heading for renaming headings (do not use replace_section_by_heading).\n"
+    "- For replace_section_by_heading: markdown MUST be the section body only (do NOT include the target heading line).\n"
+    "- For insert_after_heading: do NOT include the target heading line; subheadings (e.g. ###) are allowed.\n\n"
 )
 
 def cleaned_text(value: Any) -> Optional[str]:
@@ -192,15 +199,39 @@ def normalize_agent_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def validate_ops(ops: list[Dict[str, Any]]) -> tuple[bool, Optional[str]]:
     """Light validation to reject malformed ops."""
-    allowed = {"append_markdown", "replace_section_by_heading", "insert_after_heading"}
+    # This prevents bad tool outputs from causing confusing partial edits on the client.
+    allowed = {"append_markdown", "rename_heading", "delete_section", "replace_section_by_heading", "insert_after_heading"}
     for op in ops:
         op_type = op.get("op")
         if op_type not in allowed:
             return False, f"Invalid op type: {op_type}"
+        if op_type == "append_markdown":
+            if not cleaned_text(op.get("markdown")):
+                return False, "Missing markdown in op"
+            continue
+        if op_type == "rename_heading":
+            if not cleaned_text(op.get("heading")):
+                return False, "Missing heading in op"
+            if not cleaned_text(op.get("newHeading")):
+                return False, "Missing newHeading in op"
+            level = op.get("level")
+            if level is not None and not (isinstance(level, int) and 1 <= level <= 6):
+                return False, f"Invalid heading level: {level}"
+            continue
+        if op_type == "delete_section":
+            if not cleaned_text(op.get("heading")):
+                return False, "Missing heading in op"
+            level = op.get("level")
+            if level is not None and not (isinstance(level, int) and 1 <= level <= 6):
+                return False, f"Invalid heading level: {level}"
+            continue
+        if not cleaned_text(op.get("heading")):
+            return False, "Missing heading in op"
+        level = op.get("level")
+        if level is not None and not (isinstance(level, int) and 1 <= level <= 6):
+            return False, f"Invalid heading level: {level}"
         if not cleaned_text(op.get("markdown")):
             return False, "Missing markdown in op"
-        if op_type != "append_markdown" and not cleaned_text(op.get("heading")):
-            return False, "Missing heading in op"
     return True, None
 
 
@@ -315,6 +346,8 @@ def build_prompt(
         "You are assisting with an employee onboarding document. "
         "Call the document_edit_response tool. "
         "If the user is just chatting (e.g., greetings, questions), do NOT edit and leave opsJson/markdown empty. "
+        "If you do not return opsJson, do not claim that you edited the document. "
+        "If recentRevision is provided, acknowledge it in reply (one short clause) so the user knows you saw their manual edits. "
         "Only edit when the user clearly requests a change to the document. "
         "If mode is A, set opsJson (a JSON string of the ops array) and leave markdown empty. "
         "If mode is B, set markdown and leave opsJson empty. "
@@ -324,6 +357,7 @@ def build_prompt(
         "Reply conversationally and briefly in reply.\n\n"
         f"Base hash (echo back): {base_hash or ''}\n"
         f"Schema hints: {schema_text}\n\n"
+        f"Recent revision: {recent_revision}\n\n"
         f"Mode: {mode}\n"
         f"Message: {message}\n\n"
         f"Content:\n{content_text}"
@@ -448,6 +482,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         content=content,
         base_hash=request.baseHash,
         schema_hints=request.schemaHints,
+        recent_revision=request.recentRevision or '',
         message=request.message,
         input_items=input_items,
     )

@@ -40,6 +40,17 @@ type AiOperation =
       markdown: string
     }
   | {
+      op: 'rename_heading'
+      heading: string
+      newHeading: string
+      level?: number
+    }
+  | {
+      op: 'delete_section'
+      heading: string
+      level?: number
+    }
+  | {
       op: 'replace_section_by_heading'
       heading: string
       level?: number
@@ -300,6 +311,13 @@ export default function App() {
     })
   }
 
+  const formatOpResultMessage = (result: { applied: number; errors: string[] }, total: number) => {
+    if (result.errors.length === 0) return null
+    const summary = `Applied ${result.applied}/${total} ops.`
+    const details = result.errors.slice(0, 3).join(' | ')
+    return `${summary} Failed: ${details}${result.errors.length > 3 ? ' | …' : ''}`
+  }
+
   const applyMarkdownAtRange = (from: number, to: number, markdown: string) => {
     const applied = editor?.commands.insertContentAt(
       { from, to },
@@ -311,8 +329,26 @@ export default function App() {
     }
   }
 
+  const parseLeadingHeading = (markdown: string) => {
+    const trimmed = markdown.trimStart()
+    const match = trimmed.match(/^(#{1,6})\s+([^\n]+)\n?/)
+    if (!match) return null
+    return { level: match[1].length, text: match[2].trim(), trimmed, matchLength: match[0].length }
+  }
+
+  const stripMatchingHeading = (markdown: string, heading: string, level: number) => {
+    const parsed = parseLeadingHeading(markdown)
+    if (!parsed) return markdown
+    if (parsed.level === level && parsed.text === heading) {
+      return parsed.trimmed.slice(parsed.matchLength).replace(/^\n+/, '')
+    }
+    return markdown
+  }
+
   // Apply AI ops as small patches so we avoid full-document replacement.
   const applyAiOps = (ops: AiOperation[]) => {
+    // Translate model-friendly ops into real ProseMirror transactions.
+    // When Collaboration is enabled, these transactions are turned into Yjs updates automatically.
     if (!editor) return { applied: 0, errors: ['Editor not ready'] }
 
     let applied = 0
@@ -330,14 +366,91 @@ export default function App() {
     }
 
     ops.forEach((op) => {
-      if (!isNonEmptyString(op.markdown)) {
-        errors.push('Missing markdown in op')
+      if (op.op === 'append_markdown') {
+        if (!isNonEmptyString(op.markdown)) {
+          errors.push('Missing markdown in op')
+          return
+        }
+        const endPos = editor.state.doc.content.size
+        applyMarkdownAtRange(endPos, endPos, op.markdown)
+        applied += 1
         return
       }
 
-      if (op.op === 'append_markdown') {
-        const endPos = editor.state.doc.content.size
-        applyMarkdownAtRange(endPos, endPos, op.markdown)
+      if (op.op === 'rename_heading') {
+        const headingText = op.heading?.trim()
+        const newHeading = op.newHeading?.trim()
+        if (!headingText || !newHeading) {
+          errors.push('Missing heading/newHeading in op')
+          return
+        }
+
+        const headings = readHeadings()
+        const target = headings.find((heading) => {
+          if (heading.text !== headingText) return false
+          if (typeof op.level === 'number') {
+            return heading.level === op.level
+          }
+          return true
+        })
+
+        if (!target) {
+          errors.push(`Heading not found: ${headingText}`)
+          return
+        }
+
+        const from = target.pos + 1
+        const to = target.pos + target.nodeSize - 1
+        const ok = editor.commands.command(({ tr }) => {
+          tr.insertText(newHeading, from, to)
+          return true
+        })
+        if (!ok) {
+          errors.push('Failed to rename heading')
+          return
+        }
+        applied += 1
+        return
+      }
+
+      if (op.op === 'delete_section') {
+        const headingText = op.heading?.trim()
+        if (!headingText) {
+          errors.push('Missing heading in op')
+          return
+        }
+
+        const headings = readHeadings()
+        const target = headings.find((heading) => {
+          if (heading.text !== headingText) return false
+          if (typeof op.level === 'number') {
+            return heading.level === op.level
+          }
+          return true
+        })
+
+        if (!target) {
+          errors.push(`Heading not found: ${headingText}`)
+          return
+        }
+
+        const targetIndex = headings.indexOf(target)
+        const targetLevel = typeof op.level === 'number' ? op.level : target.level
+        const nextHeading = headings
+          .slice(targetIndex + 1)
+          .find((heading) => heading.level <= targetLevel)
+        const from = target.pos
+        const to = nextHeading ? nextHeading.pos : editor.state.doc.content.size
+
+        const ok = editor.commands.command(({ tr }) => {
+          tr.delete(from, to)
+          return true
+        })
+        if (!ok) {
+          errors.push(`Failed to delete section: ${headingText}`)
+          return
+        }
+
         applied += 1
         return
       }
@@ -372,13 +485,23 @@ export default function App() {
       const to = nextHeading ? nextHeading.pos : editor.state.doc.content.size
 
       if (op.op === 'replace_section_by_heading') {
-        applyMarkdownAtRange(from, to, op.markdown)
+        if (!isNonEmptyString(op.markdown)) {
+          errors.push('Missing markdown in op')
+          return
+        }
+        const bodyOnly = stripMatchingHeading(op.markdown, headingText, targetLevel)
+        applyMarkdownAtRange(from, to, bodyOnly)
         applied += 1
         return
       }
 
       if (op.op === 'insert_after_heading') {
-        applyMarkdownAtRange(from, from, op.markdown)
+        if (!isNonEmptyString(op.markdown)) {
+          errors.push('Missing markdown in op')
+          return
+        }
+        const bodyOnly = stripMatchingHeading(op.markdown, headingText, targetLevel)
+        applyMarkdownAtRange(from, from, bodyOnly)
         applied += 1
         return
       }
@@ -459,6 +582,15 @@ export default function App() {
           debug('edit ops applied', result)
           if (result.applied === 0) {
             throw new Error(result.errors[0] || 'AI edit returned no valid ops')
+          }
+          const warning = formatOpResultMessage(result, ops.length)
+          if (warning) {
+            pushChatMessage({
+              approach,
+              role: 'assistant',
+              text: warning,
+              timestamp: nowIso()
+            })
           }
           addRevision({
             approach,
@@ -593,6 +725,15 @@ export default function App() {
             pushStatusMessage('AI is updating the document...')
             const result = applyAiOps(ops)
             debug('chat ops applied', result)
+            const warning = formatOpResultMessage(result, ops.length)
+            if (warning) {
+              pushChatMessage({
+                approach,
+                role: 'assistant',
+                text: warning,
+                timestamp: nowIso()
+              })
+            }
             if (result.applied > 0) {
               addRevision({
                 approach,
